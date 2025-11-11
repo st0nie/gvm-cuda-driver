@@ -1,0 +1,253 @@
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <math.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <sys/types.h>
+#include <assert.h>
+#include <sys/un.h>
+#include <stdint.h>
+#include <sched.h>
+#include <stdio.h>
+
+#include "helper.h"
+#include "ringbuffer.h"
+
+extern entry_t cuda_library_entry[];
+
+// FIXME: this is not thread safe
+static int64_t g_cuda_mem_allocated = 0;
+static int64_t g_cuda_mem_total = 0UL;
+
+static const size_t g_rb_size = 1048576;
+
+static struct ringbuffer g_start_event_rb;
+static struct ringbuffer g_end_event_rb;
+
+CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, cuuint64_t flags,
+		CUdriverProcAddressQueryResult *symbolStatus);
+
+CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion, cuuint64_t flags,
+		CUdriverProcAddressQueryResult *symbolStatus);
+
+CUresult cuMemAlloc(void **devPtr, size_t size) {
+	CUresult ret = CUDA_SUCCESS;
+
+	if (g_cuda_mem_total == 0) {
+		size_t _cuda_mem_free = 0;
+		size_t _cuda_mem_total = 0;
+		CUDA_ENTRY_CALL(cuda_library_entry, cuMemGetInfo_v2, &_cuda_mem_free, &_cuda_mem_total);
+		g_cuda_mem_total = _cuda_mem_total;
+	}
+	if (g_cuda_mem_allocated + size > g_cuda_mem_total) {
+		fprintf(stderr, "[INTERCEPTOR] cuMemAlloc: out of memory.\n");
+		return CUDA_ERROR_OUT_OF_MEMORY;
+	}
+
+	ret = CUDA_ENTRY_CALL(cuda_library_entry, cuMemAlloc_v2, devPtr, size);
+	if (ret != CUDA_SUCCESS) {
+		fprintf(stderr, "[INTERCEPTOR] cuMemAllocManaged: out of memory.\n");
+		return ret;
+	}
+
+	g_cuda_mem_allocated += size;
+	printf("total cuda memory allocated: %lluMB\n", g_cuda_mem_allocated / 1024 / 1024);
+
+	return ret;
+}
+
+CUresult cuMemAllocAsync(void **devPtr, size_t size, CUstream stream) {
+	(void)stream; // suppress warning about unused stream
+
+	CUresult ret = CUDA_ENTRY_CALL(cuda_library_entry, cuMemAllocManaged, devPtr, size, CU_MEM_ATTACH_GLOBAL);
+	if (ret != CUDA_SUCCESS) {
+		fprintf(stderr, "[INTERCEPTOR] cuMemAllocAsync: out of memory.\n");
+		return ret;
+	}
+
+	g_cuda_mem_allocated += size;
+	printf("total cuda memory allocated: %lluMB\n", g_cuda_mem_allocated / 1024 / 1024);
+
+	return ret;
+}
+
+CUresult cuMemFree(void *devPtr) {
+	void *base;
+	size_t size;
+
+	if (CUDA_ENTRY_CALL(cuda_library_entry, cuMemGetAddressRange_v2, &base, &size, devPtr) == CUDA_SUCCESS)
+		g_cuda_mem_allocated -= size;
+
+	return CUDA_ENTRY_CALL(cuda_library_entry, cuMemFree_v2, devPtr);
+}
+
+CUresult cuLaunchKernel(const void* f,
+		unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+		unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
+		unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra) {
+	CUresult ret;
+
+ 	struct ringbuffer_element *start;
+ 	struct ringbuffer_element *end;
+ 	if (rb_enqueue_start(&g_start_event_rb, &start, true) != 0)
+ 		fprintf(stderr, "rb_enqueue: Unknown error\n");
+ 	if (rb_enqueue_start(&g_end_event_rb, &end, true) != 0)
+ 		fprintf(stderr, "rb_enqueue: Unknown error\n");
+
+	if (rb_elem_is_valid(start))
+		fprintf(stderr, "rb_elem_is_valid: Unknown error\n");
+	if (rb_elem_is_valid(end))
+		fprintf(stderr, "rb_elem_is_valid: Unknown error\n");
+
+	CUDA_ENTRY_CALL(cuda_library_entry, cuEventRecord, start->event, hStream);
+
+	ret = CUDA_ENTRY_CALL(cuda_library_entry, cuLaunchKernel, f, gridDimX, gridDimY, gridDimZ,
+			blockDimX, blockDimY, blockDimZ,
+			sharedMemBytes, hStream, kernelParams, extra);
+
+	CUDA_ENTRY_CALL(cuda_library_entry, cuEventRecord, end->event, hStream);
+
+	if (rb_enqueue_end(&g_start_event_rb, start) != 0)
+		fprintf(stderr, "rb_enqueue_end: Unknown error\n");
+	if (rb_enqueue_end(&g_end_event_rb, end) != 0)
+		fprintf(stderr, "rb_enqueue_end: Unknown error\n");
+
+	return ret;
+}
+
+static entry_t hooked_cuda_entry[] = {
+	{ .name = "cuMemAlloc", .fn_ptr = cuMemAlloc },
+	{ .name = "cuMemAllocAsync", .fn_ptr = cuMemAllocAsync },
+	{ .name = "cuMemFree", .fn_ptr = cuMemFree },
+	{ .name = "cuLaunchKernel", .fn_ptr = cuLaunchKernel },
+	{ .name = "cuGetProcAddress", .fn_ptr = cuGetProcAddress },
+	{ .name = "cuGetProcAddress_v2", .fn_ptr = cuGetProcAddress_v2 },
+};
+
+static size_t hooked_cuda_entry_num = sizeof(hooked_cuda_entry) / sizeof(entry_t);
+
+void *load_hooked_cuda_entry(const char *symbol) {
+	size_t hooked_cuda_entry_index;
+	void *fn_ptr = NULL;
+
+	for (hooked_cuda_entry_index = 0; hooked_cuda_entry_index < hooked_cuda_entry_num; ++hooked_cuda_entry_index) {
+		if (strcmp(symbol, hooked_cuda_entry[hooked_cuda_entry_index].name) == 0) {
+			fn_ptr = hooked_cuda_entry[hooked_cuda_entry_index].fn_ptr;
+			break;
+		}
+	}
+
+	return fn_ptr;
+}
+
+CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, cuuint64_t flags,
+		CUdriverProcAddressQueryResult *symbolStatus) {
+	CUresult ret = CUDA_ENTRY_CALL(cuda_library_entry, cuGetProcAddress, symbol, pfn, cudaVersion, flags, symbolStatus);
+	void *fn_ptr = NULL;
+	if (ret == CUDA_SUCCESS) {
+		fn_ptr = load_hooked_cuda_entry(symbol);
+		if (fn_ptr) {
+			*pfn = fn_ptr;
+		}
+		return CUDA_SUCCESS;
+	}
+	return ret;
+}
+
+CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion, cuuint64_t flags,
+		CUdriverProcAddressQueryResult *symbolStatus) {
+	CUresult ret = CUDA_ENTRY_CALL(cuda_library_entry, cuGetProcAddress_v2, symbol, pfn, cudaVersion, flags, symbolStatus);
+	void *fn_ptr = NULL;
+	if (ret == CUDA_SUCCESS) {
+		fn_ptr = load_hooked_cuda_entry(symbol);
+		if (fn_ptr) {
+			*pfn = fn_ptr;
+		}
+		return CUDA_SUCCESS;
+	}
+	return ret;
+}
+
+static pthread_t event_thread;
+static volatile bool running;
+
+static volatile size_t started = 0;
+static volatile size_t ended = 0;
+
+size_t gettime_ms(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	return (size_t)(ts.tv_sec) * 1000 + (ts.tv_nsec) / 1000000;
+}
+
+static void *event_handler(void *arg) {
+	struct ringbuffer_element *start;
+	struct ringbuffer_element *end;
+	size_t print_timestamp_ms = gettime_ms();
+
+	while (running) {
+		while (rb_peek(&g_start_event_rb, &start, false) == 0) {
+			if (!rb_elem_is_valid(start)) {
+				fprintf(stderr, "rb_elem_is_valid: Unknown error\n");
+				break;
+			}
+
+			if (CUDA_ENTRY_CALL(cuda_library_entry, cuEventQuery, start->event) != CUDA_SUCCESS)
+				break;
+
+			started += 1;
+			if (rb_dequeue(&g_start_event_rb, start) != 0)
+				fprintf(stderr, "rb_dequeue: Unknown error\n");
+		}
+
+		while (rb_peek(&g_end_event_rb, &end, false) == 0) {
+			if (!rb_elem_is_valid(end)) {
+				fprintf(stderr, "rb_elem_is_valid: Unknown error\n");
+				break;
+			}
+
+			if (CUDA_ENTRY_CALL(cuda_library_entry, cuEventQuery, end->event) != CUDA_SUCCESS)
+				break;
+
+			ended += 1;
+			if (rb_dequeue(&g_end_event_rb, end) != 0)
+				fprintf(stderr, "rb_dequeue: Unknown error\n");
+		}
+
+		if (gettime_ms() - print_timestamp_ms > 1000) {
+			fprintf(stderr, "started %lld, ended %lld, pending %lld\n", started, ended, started - ended);
+			print_timestamp_ms = gettime_ms();
+		}
+	}
+
+	return NULL;
+}
+
+__attribute__((constructor))
+void init(void) {
+	running = true;
+	rb_init(&g_start_event_rb, g_rb_size);
+	rb_init(&g_end_event_rb, g_rb_size);
+	if (pthread_create(&event_thread, NULL, event_handler, NULL) != 0) {
+		perror("pthread_create failed");
+		exit(1);
+	}
+}
+
+__attribute__((destructor))
+void fini(void) {
+	running = false;
+	if (pthread_join(event_thread, NULL) != 0)
+		perror("pthread_join failed");
+
+	rb_deinit(&g_start_event_rb);
+	rb_deinit(&g_end_event_rb);
+
+	printf("Submitted %llu kernels, finished %llu kernels\n", started, ended);
+}
