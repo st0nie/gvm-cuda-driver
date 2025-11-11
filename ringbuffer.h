@@ -19,6 +19,7 @@ struct ringbuffer_element {
 struct ringbuffer {
 	struct ringbuffer_element *array;
 	size_t size;				   // capacity (number of elements)
+	char name[16];
 	_Atomic size_t read_index;	 // total number of dequeued elements
 	_Atomic size_t write_index;	// total number of enqueued reservations
 };
@@ -29,7 +30,7 @@ static inline void rb_pause(void)
 	sched_yield();
 }
 
-int rb_init(struct ringbuffer *rb, size_t size)
+int rb_init(struct ringbuffer *rb, size_t size, char *name)
 {
 	if (!rb || size == 0)
 		return -1;
@@ -40,6 +41,7 @@ int rb_init(struct ringbuffer *rb, size_t size)
 		return -2;
 
 	rb->size = size;
+	strncpy(rb->name, name, 16);
 	atomic_store_explicit(&rb->read_index, 0, memory_order_relaxed);
 	atomic_store_explicit(&rb->write_index, 0, memory_order_relaxed);
 

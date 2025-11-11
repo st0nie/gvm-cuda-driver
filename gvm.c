@@ -174,7 +174,8 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion, cu
 	return ret;
 }
 
-static pthread_t event_thread;
+static pthread_t start_event_thread;
+static pthread_t end_event_thread;
 static volatile bool running;
 
 static volatile size_t started = 0;
@@ -187,41 +188,28 @@ size_t gettime_ms(void) {
 }
 
 static void *event_handler(void *arg) {
-	struct ringbuffer_element *start;
-	struct ringbuffer_element *end;
+	struct ringbuffer *rb = (struct ringbuffer *)arg;
+	struct ringbuffer_element *elem = NULL;
 	size_t print_timestamp_ms = gettime_ms();
+	size_t count = 0;
 
 	while (running) {
-		while (rb_peek(&g_start_event_rb, &start, false) == 0) {
-			if (!rb_elem_is_valid(start)) {
+		while (rb_peek(rb, &elem, false) == 0) {
+			if (!rb_elem_is_valid(elem)) {
 				fprintf(stderr, "rb_elem_is_valid: Unknown error\n");
 				break;
 			}
 
-			if (CUDA_ENTRY_CALL(cuda_library_entry, cuEventQuery, start->event) != CUDA_SUCCESS)
+			if (CUDA_ENTRY_CALL(cuda_library_entry, cuEventQuery, elem->event) != CUDA_SUCCESS)
 				break;
 
-			started += 1;
-			if (rb_dequeue(&g_start_event_rb, start) != 0)
-				fprintf(stderr, "rb_dequeue: Unknown error\n");
-		}
-
-		while (rb_peek(&g_end_event_rb, &end, false) == 0) {
-			if (!rb_elem_is_valid(end)) {
-				fprintf(stderr, "rb_elem_is_valid: Unknown error\n");
-				break;
-			}
-
-			if (CUDA_ENTRY_CALL(cuda_library_entry, cuEventQuery, end->event) != CUDA_SUCCESS)
-				break;
-
-			ended += 1;
-			if (rb_dequeue(&g_end_event_rb, end) != 0)
+			count += 1;
+			if (rb_dequeue(rb, elem) != 0)
 				fprintf(stderr, "rb_dequeue: Unknown error\n");
 		}
 
 		if (gettime_ms() - print_timestamp_ms > 1000) {
-			fprintf(stderr, "started %lld, ended %lld, pending %lld\n", started, ended, started - ended);
+			fprintf(stderr, "%s event count %lld\n", rb->name, count);
 			print_timestamp_ms = gettime_ms();
 		}
 	}
@@ -232,9 +220,13 @@ static void *event_handler(void *arg) {
 __attribute__((constructor))
 void init(void) {
 	running = true;
-	rb_init(&g_start_event_rb, g_rb_size);
-	rb_init(&g_end_event_rb, g_rb_size);
-	if (pthread_create(&event_thread, NULL, event_handler, NULL) != 0) {
+	rb_init(&g_start_event_rb, g_rb_size, "start");
+	rb_init(&g_end_event_rb, g_rb_size, "end");
+	if (pthread_create(&start_event_thread, NULL, event_handler, &g_start_event_rb) != 0) {
+		perror("pthread_create failed");
+		exit(1);
+	}
+	if (pthread_create(&end_event_thread, NULL, event_handler, &g_end_event_rb) != 0) {
 		perror("pthread_create failed");
 		exit(1);
 	}
@@ -243,11 +235,11 @@ void init(void) {
 __attribute__((destructor))
 void fini(void) {
 	running = false;
-	if (pthread_join(event_thread, NULL) != 0)
+	if (pthread_join(start_event_thread, NULL) != 0)
+		perror("pthread_join failed");
+	if (pthread_join(end_event_thread, NULL) != 0)
 		perror("pthread_join failed");
 
 	rb_deinit(&g_start_event_rb);
 	rb_deinit(&g_end_event_rb);
-
-	printf("Submitted %llu kernels, finished %llu kernels\n", started, ended);
 }
