@@ -27,8 +27,9 @@ static int64_t g_cuda_mem_total = 0UL;
 
 static const size_t g_rb_size = 1048576;
 
-static struct ringbuffer g_start_event_rb;
-static struct ringbuffer g_end_event_rb;
+static struct ringbuffer g_event_rb;
+
+static _Atomic size_t submitted;
 
 CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, cuuint64_t flags,
 		CUdriverProcAddressQueryResult *symbolStatus);
@@ -93,29 +94,22 @@ CUresult cuLaunchKernel(const void* f,
 		unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra) {
 	CUresult ret;
 
- 	struct ringbuffer_element *start;
- 	struct ringbuffer_element *end;
- 	if (rb_enqueue_start(&g_start_event_rb, &start, true) != 0)
- 		fprintf(stderr, "rb_enqueue: Unknown error\n");
- 	if (rb_enqueue_start(&g_end_event_rb, &end, true) != 0)
+ 	struct ringbuffer_element *elem;
+ 	if (rb_enqueue_start(&g_event_rb, &elem, true) != 0)
  		fprintf(stderr, "rb_enqueue: Unknown error\n");
 
-	if (rb_elem_is_valid(start))
+	if (rb_elem_is_valid(elem))
 		fprintf(stderr, "rb_elem_is_valid: Unknown error\n");
-	if (rb_elem_is_valid(end))
-		fprintf(stderr, "rb_elem_is_valid: Unknown error\n");
-
-	CUDA_ENTRY_CALL(cuda_library_entry, cuEventRecord, start->event, hStream);
 
 	ret = CUDA_ENTRY_CALL(cuda_library_entry, cuLaunchKernel, f, gridDimX, gridDimY, gridDimZ,
 			blockDimX, blockDimY, blockDimZ,
 			sharedMemBytes, hStream, kernelParams, extra);
 
-	CUDA_ENTRY_CALL(cuda_library_entry, cuEventRecord, end->event, hStream);
+	atomic_fetch_add_explicit(&submitted, 1, memory_order_relaxed);
 
-	if (rb_enqueue_end(&g_start_event_rb, start) != 0)
-		fprintf(stderr, "rb_enqueue_end: Unknown error\n");
-	if (rb_enqueue_end(&g_end_event_rb, end) != 0)
+	CUDA_ENTRY_CALL(cuda_library_entry, cuEventRecord, elem->event, hStream);
+
+	if (rb_enqueue_end(&g_event_rb, elem) != 0)
 		fprintf(stderr, "rb_enqueue_end: Unknown error\n");
 
 	return ret;
@@ -174,12 +168,8 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion, cu
 	return ret;
 }
 
-static pthread_t start_event_thread;
-static pthread_t end_event_thread;
+static pthread_t event_thread;
 static volatile bool running;
-
-static volatile size_t started = 0;
-static volatile size_t ended = 0;
 
 size_t gettime_ms(void) {
 	struct timespec ts;
@@ -209,7 +199,7 @@ static void *event_handler(void *arg) {
 		}
 
 		if (gettime_ms() - print_timestamp_ms > 1000) {
-			fprintf(stderr, "%s event count %lld\n", rb->name, count);
+			fprintf(stderr, "Submit count %lld, %s count %lld\n", atomic_load_explicit(&submitted, memory_order_relaxed), rb->name, count);
 			print_timestamp_ms = gettime_ms();
 		}
 	}
@@ -219,14 +209,10 @@ static void *event_handler(void *arg) {
 
 __attribute__((constructor))
 void init(void) {
+	atomic_store_explicit(&submitted, 0, memory_order_relaxed);
 	running = true;
-	rb_init(&g_start_event_rb, g_rb_size, "start");
-	rb_init(&g_end_event_rb, g_rb_size, "end");
-	if (pthread_create(&start_event_thread, NULL, event_handler, &g_start_event_rb) != 0) {
-		perror("pthread_create failed");
-		exit(1);
-	}
-	if (pthread_create(&end_event_thread, NULL, event_handler, &g_end_event_rb) != 0) {
+	rb_init(&g_event_rb, g_rb_size, "End");
+	if (pthread_create(&event_thread, NULL, event_handler, &g_event_rb) != 0) {
 		perror("pthread_create failed");
 		exit(1);
 	}
@@ -235,11 +221,8 @@ void init(void) {
 __attribute__((destructor))
 void fini(void) {
 	running = false;
-	if (pthread_join(start_event_thread, NULL) != 0)
-		perror("pthread_join failed");
-	if (pthread_join(end_event_thread, NULL) != 0)
+	if (pthread_join(event_thread, NULL) != 0)
 		perror("pthread_join failed");
 
-	rb_deinit(&g_start_event_rb);
-	rb_deinit(&g_end_event_rb);
+	rb_deinit(&g_event_rb);
 }
