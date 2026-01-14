@@ -1,5 +1,5 @@
-# Intercept Layer for NVIDIA CUDA Driver
-This is the source release of the Intercept Layer for NVIDIA CUDA Driver, tested with CUDA Driver 12.9 and GPU Driver 575.57.08.
+# GVM Intercept Layer for NVIDIA CUDA Driver
+This is the source release of the GVM Intercept Layer for NVIDIA CUDA Driver, tested with CUDA Driver 12.9 and GPU Driver 575.57.08.
 
 ## Requirements
 1. gcc
@@ -49,14 +49,7 @@ make install CUDA=<path to cuda driver>
 ```
 
 ## How to use
-If you choose to replace existing cuda driver using:
-```
-sudo make install INSTALL=$(dirname $(whereis libcuda.so | awk '{print $2}'))
-```
-You should be able to work with any CUDA programs.
-We've tested with `vllm`, `sglang`, `diffuser`, `llama-factory`, `llama.cpp`.
-
-If you choose to put intercept layer somewhere else to keep your system clean:
+For the destination dir you choose to install the intercept layer:
 ```
 make install INSTALL=<path to dir>
 ```
