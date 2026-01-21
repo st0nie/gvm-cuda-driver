@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <sched.h>
 #include <stdio.h>
+#include <sys/sysinfo.h>
 
 #include <cuda.h>
 
@@ -29,6 +30,7 @@
 // FIXME: this is not thread safe
 static int64_t g_cuda_mem_allocated = 0;
 static int64_t g_cuda_mem_total = 0UL;
+static int64_t g_unified_mem_limit = 0UL;  // CPU + GPU unified memory limit
 
 static const size_t g_rb_size = 1048576;
 
@@ -53,6 +55,18 @@ CUresult cuMemAlloc_v2_WRAPPER(void **devPtr, size_t size) {
 		size_t _cuda_mem_total = 0;
 		cuMemGetInfo_v2_IMPL(&_cuda_mem_free, &_cuda_mem_total);
 		g_cuda_mem_total = _cuda_mem_total;
+		
+		// Get system memory info for oversubscription support
+		struct sysinfo info;
+		if (sysinfo(&info) == 0) {
+			// Calculate unified memory limit as CPU RAM + GPU memory
+			// Using total system memory (not just free memory)
+			int64_t cpu_mem = (int64_t)info.totalram * (int64_t)info.mem_unit;
+			g_unified_mem_limit = cpu_mem + g_cuda_mem_total;
+		} else {
+			// Fallback: use only GPU memory if sysinfo fails
+			g_unified_mem_limit = g_cuda_mem_total;
+		}
 	}
 	if (g_uvmfd < 0) {
 		CUdevice device;
@@ -68,8 +82,10 @@ CUresult cuMemAlloc_v2_WRAPPER(void **devPtr, size_t size) {
 		printf("Find uvmfd at %d\n", g_uvmfd);
 	}
 
-	if (g_cuda_mem_allocated + size > g_cuda_mem_total) {
-		fprintf(stderr, "[INTERCEPTOR] cuMemAlloc: out of memory.\n");
+	// Allow oversubscription to CPU+GPU unified memory instead of just GPU memory
+	if (g_cuda_mem_allocated + size > g_unified_mem_limit) {
+		fprintf(stderr, "[INTERCEPTOR] cuMemAlloc: out of unified memory. Allocated: %ld MB, Requested: %ld MB, Limit: %ld MB\n",
+				g_cuda_mem_allocated / 1024 / 1024, size / 1024 / 1024, g_unified_mem_limit / 1024 / 1024);
 		return CUDA_ERROR_OUT_OF_MEMORY;
 	}
 
@@ -80,7 +96,9 @@ CUresult cuMemAlloc_v2_WRAPPER(void **devPtr, size_t size) {
 	}
 
 	g_cuda_mem_allocated += size;
-	printf("total cuda memory allocated: %luMB\n", g_cuda_mem_allocated / 1024 / 1024);
+	printf("total cuda memory allocated: %luMB (%.1f%% of unified limit)\n", 
+			g_cuda_mem_allocated / 1024 / 1024, 
+			(double)g_cuda_mem_allocated / g_unified_mem_limit * 100.0);
 
 	return ret;
 }
